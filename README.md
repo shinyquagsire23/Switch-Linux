@@ -37,6 +37,7 @@ Installation of u-boot will depend on loading methods used. However once u-boot 
 - `make O=build/hac-001/ -j4 Image`
 - Copy the Image file from `build/hac-001/arch/arm64/boot/Image` to the `boot/` folder on your SD card's FAT partition.
 - In this repo, `mkimage -A arm -T script -O linux -d u-boot/boot.txt u-boot/boot.scr` and copy `boot.scr` to the `boot/` directory on the FAT partition of your SD card.
+- `make O=build/hac-001/ -j4 modules_install INSTALL_MOD_PATH=/path/to/ALARM/rootfs/`, you may need to run as root (with environment variables set again).
 - ALARM has a default initramfs which needs to be wrapped for u-boot. `mkimage -T ramdisk -C gzip -d /path/to/initramfs-linux.img /path/to/FAT/boot/initramfs.uImage`
 - In the repo, `cd device-tree && sh build.sh && cp tegra210-hac-001.dtb /path/to/FAT/boot/`
 - Your FAT `boot/` directory should have `Image`, `initramfs.uImage`, and `tegra210-hac-001.dtb`
@@ -44,6 +45,7 @@ Installation of u-boot will depend on loading methods used. However once u-boot 
 
 ### TODO
 - Get USB working
+- Get WiFi/BT(?) working
 - Get nouveau working
 - Get audio working
 - Get touchscreen working
