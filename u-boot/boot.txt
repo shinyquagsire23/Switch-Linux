@@ -1,0 +1,23 @@
+#printenv
+
+if gpio input X7; then 
+    ums 0 mmc 1
+else
+    echo Volume Button Down not pressed
+fi;
+
+if gpio input X6; then 
+    ums 0 mmc 0
+else
+    echo Volume Button Up not pressed
+fi;
+
+mmc dev 1
+load mmc 1:1 ${kernel_addr_r} boot/Image
+load mmc 1:1 ${ramdisk_addr_r} boot/initramfs.uImage
+load mmc 1:1 ${fdt_addr_r} boot/tegra210-hac-001.dtb
+setenv bootargs log_buf_len=10M print_fatal_signals=1 LOGLEVEL=4 earlycon=uart8250,mmio32,0x70006040 earlyprintk console=ttyS0,115200n8 console=tty1 fbcon=rotate:3 video=DSI-1:720x1232 drm.atomic=1 consoleblank=0 rd.driver.blacklist=nouveau clk_ignore_unused root=/dev/mmcblk1p2 rw rootwait #initcall_debug debug ignore_loglevel
+booti ${kernel_addr_r} ${ramdisk_addr_r} ${fdt_addr_r}
+
+# Fallback
+ums 0 mmc 1

@@ -1,0 +1,559 @@
+From 770f0d4037ba71720d352117ef0b43b4e527f836 Mon Sep 17 00:00:00 2001
+From: shinyquagsire23 <mtinc2@gmail.com>
+Date: Sat, 21 Apr 2018 12:59:00 -0600
+Subject: switch panel
+
+---
+ drivers/gpu/drm/panel/Kconfig          |  11 +
+ drivers/gpu/drm/panel/Makefile         |   1 +
+ drivers/gpu/drm/panel/panel-hac-720p.c | 509 +++++++++++++++++++++++++++++++++
+ 3 files changed, 521 insertions(+)
+ create mode 100644 drivers/gpu/drm/panel/panel-hac-720p.c
+
+diff --git a/drivers/gpu/drm/panel/Kconfig b/drivers/gpu/drm/panel/Kconfig
+index 726f3fb3312d..214a2a1bda21 100644
+--- a/drivers/gpu/drm/panel/Kconfig
++++ b/drivers/gpu/drm/panel/Kconfig
+@@ -150,4 +150,15 @@ config DRM_PANEL_SITRONIX_ST7789V
+ 	  Say Y here if you want to enable support for the Sitronix
+ 	  ST7789V controller for 240x320 LCD panels
+ 
++config DRM_PANEL_HAC_720P
++	tristate "Nintendo Switch 720p DSI panel"
++	depends on OF
++	depends on DRM_MIPI_DSI
++	depends on BACKLIGHT_CLASS_DEVICE
++	help
++	  Say Y here if you want to enable support for 720P DSI video mode
++	  panel as found in Nintendo Switch devices.
++	  The panel has a 1280x720 resolution and uses
++	  24 bit per pixel.
++
+ endmenu
+diff --git a/drivers/gpu/drm/panel/Makefile b/drivers/gpu/drm/panel/Makefile
+index 2c4e1a93e05f..8a6ec424f50d 100644
+--- a/drivers/gpu/drm/panel/Makefile
++++ b/drivers/gpu/drm/panel/Makefile
+@@ -15,3 +15,4 @@ obj-$(CONFIG_DRM_PANEL_SEIKO_43WVF1G) += panel-seiko-43wvf1g.o
+ obj-$(CONFIG_DRM_PANEL_SHARP_LQ101R1SX01) += panel-sharp-lq101r1sx01.o
+ obj-$(CONFIG_DRM_PANEL_SHARP_LS043T1LE01) += panel-sharp-ls043t1le01.o
+ obj-$(CONFIG_DRM_PANEL_SITRONIX_ST7789V) += panel-sitronix-st7789v.o
++obj-$(CONFIG_DRM_PANEL_HAC_720P) += panel-hac-720p.o
+diff --git a/drivers/gpu/drm/panel/panel-hac-720p.c b/drivers/gpu/drm/panel/panel-hac-720p.c
+new file mode 100644
+index 000000000000..9cba93ac9b78
+--- /dev/null
++++ b/drivers/gpu/drm/panel/panel-hac-720p.c
+@@ -0,0 +1,509 @@
++/*
++ * Copyright (C) 2016 InforceComputing
++ * Author: Vinay Simha BN <simhavcs@gmail.com>
++ *
++ * Copyright (C) 2016 Linaro Ltd
++ * Author: Sumit Semwal <sumit.semwal@linaro.org>
++ *
++ * Copyright (C) 2018 Max Thomas <mtinc2@gmail.com>
++ *
++ * Based on loosely on code from the panel for Nexus 7 2nd Gen, a panel
++ * driver for the Nintendo Switch (HAC-001)'s 720p panel.W
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 as published by
++ * the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++ * more details.
++ *
++ * You should have received a copy of the GNU General Public License along with
++ * this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++#include <linux/backlight.h>
++#include <linux/gpio/consumer.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/regulator/consumer.h>
++
++#include <drm/drmP.h>
++#include <drm/drm_crtc.h>
++#include <drm/drm_mipi_dsi.h>
++#include <drm/drm_panel.h>
++
++#include <video/mipi_display.h>
++
++struct hac_panel {
++	struct drm_panel base;
++	struct mipi_dsi_device *dsi;
++
++	struct gpio_desc *bl_gpio;
++	struct gpio_desc *enable_gpio;
++	struct gpio_desc *reset_gpio;
++	struct gpio_desc *pvdd_gpio;
++	struct gpio_desc *nvdd_gpio;
++	//struct backlight_device *backlight;
++
++	bool prepared;
++	bool enabled;
++
++	const struct drm_display_mode *mode;
++};
++
++static inline struct hac_panel *to_hac_panel(struct drm_panel *panel)
++{
++	return container_of(panel, struct hac_panel, base);
++}
++
++static int hac_panel_init(struct hac_panel *hac)
++{
++	struct mipi_dsi_device *dsi = hac->dsi;
++	struct device *dev = &hac->dsi->dev;
++	int ret, i;
++	u8 display_id[64];
++
++	dsi->mode_flags |= MIPI_DSI_MODE_LPM;
++
++	dev_dbg(dev, "panel init\n");
++
++	mipi_dsi_set_maximum_return_packet_size(dsi, 3);
++
++	ret = mipi_dsi_dcs_read(dsi, MIPI_DCS_GET_DISPLAY_ID, display_id, sizeof(display_id));
++	if (ret < 0) {
++		dev_err(dev, "failed to do get id: %d\n", ret);
++		return ret;
++	}
++
++	dev_dbg(dev, "got %u bytes display id,\n", ret);
++	for (i = 0; i < ret; i++) {
++		dev_dbg(dev, "%02x ", display_id[i]);
++	}
++	dev_dbg(dev, "\n");
++	
++	// Extra commands for some panels
++	if (display_id[0] == 0x10) {
++		ret = mipi_dsi_dcs_write_buffer(dsi, (u8[]){0xB9, 0xff, 0x83, 0x94}, 4);
++		if (ret < 0) {
++			dev_err(dev, "failed to do a thing: %d\n", ret);
++			return ret;
++		}
++		
++		ret = mipi_dsi_dcs_write_buffer(dsi, (u8[]){0xBD, 0x00}, 2);
++		if (ret < 0) {
++			dev_err(dev, "failed to do a thing 2: %d\n", ret);
++			return ret;
++		}
++		
++		ret = mipi_dsi_dcs_write_buffer(dsi, (u8[]){0xD8, 0xAA, 0xAA, 0xAA, 
++		                                            0xEB, 0xAA, 0xAA, 0xAA, 
++		                                            0xAA, 0xAA, 0xEB, 0xAA, 
++		                                            0xAA, 0xAA, 0xAA, 0xAA, 
++		                                            0xEB, 0xAA, 0xAA, 0xAA, 
++		                                            0xAA, 0xAA, 0xEB, 0xAA, 
++		                                            0xAA}, 0x19);
++		if (ret < 0) {
++			dev_err(dev, "failed to do a thing 3: %d\n", ret);
++			return ret;
++		}
++
++		ret = mipi_dsi_dcs_write_buffer(dsi, (u8[]){0xBD, 0x01}, 2);
++		if (ret < 0) {
++			dev_err(dev, "failed to do a thing 4: %d\n", ret);
++			return ret;
++		}
++		
++		ret = mipi_dsi_dcs_write_buffer(dsi, (u8[]){0xD8, 0xFF, 0xFF, 0xFF,
++		                                            0xFF, 0xFF, 0xFF, 0xFF,
++		                                            0xFF, 0xFF, 0xFF, 0xFF,
++		                                            0xFF, 0xFF, 0xFF, 0xFF,
++		                                            0xFF, 0xFF, 0xFF, 0xFF,
++		                                            0xFF, 0xFF, 0xFF, 0xFF,
++		                                            0xFF, 0xFF, 0xFF, 0xFF,
++		                                            0xFF, 0xFF, 0xFF, 0xFF,
++		                                            0xFF, 0xFF, 0xFF, 0xFF,
++		                                            0xFF, 0xFF, 0xFF}, 0x27);
++		if (ret < 0) {
++			dev_err(dev, "failed to do a thing 3: %d\n", ret);
++			return ret;
++		}
++		
++		ret = mipi_dsi_dcs_write_buffer(dsi, (u8[]){0xBD, 0x02}, 2);
++		if (ret < 0) {
++			dev_err(dev, "failed to do a thing 4: %d\n", ret);
++			return ret;
++		}
++		
++		ret = mipi_dsi_dcs_write_buffer(dsi, (u8[]){0xD8, 0xFF, 0xFF, 0xFF,
++		                                            0xFF, 0xFF, 0xFF, 0xFF,
++		                                            0xFF, 0xFF, 0xFF, 0xFF,
++		                                            0xFF, 0xFF, 0xFF,}, 0xF);
++		if (ret < 0) {
++			dev_err(dev, "failed to do a thing 5: %d\n", ret);
++			return ret;
++		}
++
++		ret = mipi_dsi_dcs_write_buffer(dsi, (u8[]){0xD9, 0x06}, 2);
++		if (ret < 0) {
++			dev_err(dev, "failed to do a thing 6: %d\n", ret);
++			return ret;
++		}
++
++		ret = mipi_dsi_dcs_write_buffer(dsi, (u8[]){0xB9, 0x0, 0x0, 0x0}, 4);
++		if (ret < 0) {
++			dev_err(dev, "failed to do a thing 7: %d\n", ret);
++			return ret;
++		}
++	}
++	
++	ret = mipi_dsi_dcs_exit_sleep_mode(dsi);
++	if (ret < 0) {
++		dev_err(dev, "failed to set exit sleep mode: %d\n", ret);
++		return ret;
++	}
++	
++	usleep_range(180000, 200000);
++
++	return 0;
++}
++
++static int hac_panel_on(struct hac_panel *hac)
++{
++	struct mipi_dsi_device *dsi = hac->dsi;
++	struct device *dev = &hac->dsi->dev;
++	int ret;
++
++	dsi->mode_flags |= MIPI_DSI_MODE_LPM;
++
++	dev_dbg(dev, "panel on\n");
++
++	ret = mipi_dsi_dcs_set_display_on(dsi);
++	usleep_range(10000, 20000);
++	if (ret < 0)
++		dev_err(dev, "failed to set display on: %d\n", ret);
++
++	return ret;
++}
++
++static void hac_panel_off(struct hac_panel *hac)
++{
++	struct mipi_dsi_device *dsi = hac->dsi;
++	struct device *dev = &hac->dsi->dev;
++	int ret;
++
++	dsi->mode_flags &= ~MIPI_DSI_MODE_LPM;
++	
++	dev_dbg(dev, "panel off\n");
++
++	ret = mipi_dsi_dcs_set_display_off(dsi);
++	if (ret < 0)
++		dev_err(dev, "failed to set display off: %d\n", ret);
++
++	ret = mipi_dsi_dcs_enter_sleep_mode(dsi);
++	if (ret < 0)
++		dev_err(dev, "failed to enter sleep mode: %d\n", ret);
++
++	msleep(100);
++}
++
++static int hac_panel_disable(struct drm_panel *panel)
++{
++	struct hac_panel *hac = to_hac_panel(panel);
++
++	if (!hac->enabled)
++		return 0;
++
++	dev_dbg(&hac->dsi->dev, "panel disable\n");
++
++	//backlight_disable(hac->backlight);
++
++	hac->enabled = false;
++
++	return 0;
++}
++
++static int hac_panel_unprepare(struct drm_panel *panel)
++{
++	struct hac_panel *hac = to_hac_panel(panel);
++	struct device *dev = &hac->dsi->dev;
++	int ret;
++
++	if (!hac->prepared)
++		return 0;
++
++	dev_dbg(dev, "panel unprep\n");
++
++	hac_panel_off(hac);
++
++	gpiod_set_value(hac->bl_gpio, 0);
++
++	gpiod_set_value(hac->enable_gpio, 0);
++
++	gpiod_set_value(hac->reset_gpio, 0);
++
++	gpiod_set_value(hac->nvdd_gpio, 0);
++	
++	gpiod_set_value(hac->pvdd_gpio, 0);
++	hac->prepared = false;
++
++	return 0;
++}
++
++static int hac_panel_prepare(struct drm_panel *panel)
++{
++	struct hac_panel *hac = to_hac_panel(panel);
++	struct device *dev = &hac->dsi->dev;
++	int ret;
++
++	if (hac->prepared)
++		return 0;
++		
++	dev_dbg(dev, "panel prep\n");
++
++	gpiod_set_value(hac->pvdd_gpio, 1);
++	usleep_range(10, 20);
++
++	gpiod_set_value(hac->nvdd_gpio, 1);
++	usleep_range(10, 20);
++
++	gpiod_set_value(hac->reset_gpio, 1);
++	usleep_range(10, 20);
++
++	gpiod_set_value(hac->enable_gpio, 1);
++	usleep_range(10, 20);
++	
++	gpiod_set_value(hac->bl_gpio, 1);
++	usleep_range(10, 20);
++
++	ret = hac_panel_init(hac);
++	if (ret < 0) {
++		dev_err(dev, "failed to init panel: %d\n", ret);
++		goto poweroff;
++	}
++
++	ret = hac_panel_on(hac);
++	if (ret < 0) {
++		dev_err(dev, "failed to set panel on: %d\n", ret);
++		goto poweroff;
++	}
++
++	hac->prepared = true;
++
++	return 0;
++
++poweroff:
++	gpiod_set_value(hac->bl_gpio, 0);
++
++	gpiod_set_value(hac->enable_gpio, 0);
++
++	gpiod_set_value(hac->reset_gpio, 0);
++
++	gpiod_set_value(hac->nvdd_gpio, 0);
++	
++	gpiod_set_value(hac->pvdd_gpio, 0);
++
++	return ret;
++}
++
++static int hac_panel_enable(struct drm_panel *panel)
++{
++	struct hac_panel *hac = to_hac_panel(panel);
++
++	if (hac->enabled)
++		return 0;
++		
++	dev_dbg(&hac->dsi->dev, "panel enable\n");
++#if 0
++	backlight_enable(hac->backlight);
++#endif
++	hac->enabled = true;
++
++	return 0;
++}
++
++static const struct drm_display_mode default_mode = {
++		.clock = 77904,
++		.vdisplay = 1280,
++		.vsync_start = 1280 + 136,
++		.vsync_end = 1280 + 136 + 72,
++		.vtotal = 1280 + 136 + 72 + 72,
++		.hdisplay = 720,
++		.hsync_start = 720 + 10,
++		.hsync_end = 720 + 10 + 9,
++		.htotal = 720 + 10 + 9 + 1,
++		.vrefresh = 60,
++		.flags = 0,
++};
++
++static int hac_panel_get_modes(struct drm_panel *panel)
++{
++	struct drm_display_mode *mode;
++	struct hac_panel *hac = to_hac_panel(panel);
++	struct device *dev = &hac->dsi->dev;
++
++	mode = drm_mode_duplicate(panel->drm, &default_mode);
++	if (!mode) {
++		dev_err(dev, "failed to add mode %ux%ux@%u\n",
++			default_mode.hdisplay, default_mode.vdisplay,
++			default_mode.vrefresh);
++		return -ENOMEM;
++	}
++
++	drm_mode_set_name(mode);
++
++	drm_mode_probed_add(panel->connector, mode);
++
++	panel->connector->display_info.width_mm = 137;
++	panel->connector->display_info.height_mm = 77;
++
++	return 1;
++}
++
++static const struct drm_panel_funcs hac_panel_funcs = {
++	.disable = hac_panel_disable,
++	.unprepare = hac_panel_unprepare,
++	.prepare = hac_panel_prepare,
++	.enable = hac_panel_enable,
++	.get_modes = hac_panel_get_modes,
++};
++
++static const struct of_device_id hac_of_match[] = {
++	{ .compatible = "nintendo,hac-720p", },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, hac_of_match);
++
++static int hac_panel_add(struct hac_panel *hac)
++{
++	struct device *dev = &hac->dsi->dev;
++	int ret;
++	unsigned int i;
++
++	hac->mode = &default_mode;
++	
++	dev_dbg(dev, "panel add\n");
++
++	hac->bl_gpio = devm_gpiod_get(dev, "bl", GPIOD_OUT_LOW);
++	if (IS_ERR(hac->bl_gpio)) {
++		ret = PTR_ERR(hac->bl_gpio);
++		dev_err(dev, "cannot get bl-gpio %d\n", ret);
++		return ret;
++	}
++
++	hac->enable_gpio = devm_gpiod_get(dev, "enable", GPIOD_OUT_LOW);
++	if (IS_ERR(hac->enable_gpio)) {
++		ret = PTR_ERR(hac->enable_gpio);
++		dev_err(dev, "cannot get enable-gpio %d\n", ret);
++		return ret;
++	}
++
++	hac->reset_gpio = devm_gpiod_get(dev, "reset", GPIOD_OUT_HIGH);
++	if (IS_ERR(hac->reset_gpio)) {
++		ret = PTR_ERR(hac->reset_gpio);
++		dev_err(dev, "cannot get reset-gpios %d\n", ret);
++		return ret;
++	}
++	
++	hac->pvdd_gpio = devm_gpiod_get(dev, "pvdd", GPIOD_OUT_LOW);
++	if (IS_ERR(hac->pvdd_gpio)) {
++		ret = PTR_ERR(hac->pvdd_gpio);
++		dev_err(dev, "cannot get pvdd-gpio %d\n", ret);
++		return ret;
++	}
++	
++	hac->nvdd_gpio = devm_gpiod_get(dev, "nvdd", GPIOD_OUT_LOW);
++	if (IS_ERR(hac->nvdd_gpio)) {
++		ret = PTR_ERR(hac->nvdd_gpio);
++		dev_err(dev, "cannot get nvdd-gpio %d\n", ret);
++		return ret;
++	}
++
++	drm_panel_init(&hac->base);
++	hac->base.funcs = &hac_panel_funcs;
++	hac->base.dev = &hac->dsi->dev;
++
++	ret = drm_panel_add(&hac->base);
++
++	return ret;
++}
++
++static void hac_panel_del(struct hac_panel *hac)
++{
++	if (hac->base.dev)
++		drm_panel_remove(&hac->base);
++	dev_dbg(&hac->dsi->dev, "panel del\n");
++}
++
++static int hac_panel_probe(struct mipi_dsi_device *dsi)
++{
++	struct hac_panel *hac;
++	int ret;
++
++	dsi->lanes = 4;
++	dsi->format = MIPI_DSI_FMT_RGB888;
++	dsi->mode_flags = MIPI_DSI_MODE_VIDEO | MIPI_DSI_CLOCK_NON_CONTINUOUS;
++
++	hac = devm_kzalloc(&dsi->dev, sizeof(*hac), GFP_KERNEL);
++	if (!hac)
++		return -ENOMEM;
++
++	mipi_dsi_set_drvdata(dsi, hac);
++
++	hac->dsi = dsi;
++
++	ret = hac_panel_add(hac);
++	if (ret < 0) {
++		dev_err(&hac->dsi->dev, "panel add failed with %d\n", ret);
++		return ret;
++	}
++
++	ret = mipi_dsi_attach(dsi);
++	if (ret < 0)
++		dev_err(&hac->dsi->dev, "panel failed to attach %d\n", ret);
++	return ret;
++}
++
++static int hac_panel_remove(struct mipi_dsi_device *dsi)
++{
++	struct hac_panel *hac = mipi_dsi_get_drvdata(dsi);
++	int ret;
++	
++	dev_dbg(&hac->dsi->dev, "panel remove\n");
++
++	ret = hac_panel_disable(&hac->base);
++	if (ret < 0)
++		dev_err(&dsi->dev, "failed to disable panel: %d\n", ret);
++
++	ret = mipi_dsi_detach(dsi);
++	if (ret < 0)
++		dev_err(&dsi->dev, "failed to detach from DSI host: %d\n",
++			ret);
++
++	drm_panel_detach(&hac->base);
++	hac_panel_del(hac);
++
++	return 0;
++}
++
++static void hac_panel_shutdown(struct mipi_dsi_device *dsi)
++{
++	struct hac_panel *hac = mipi_dsi_get_drvdata(dsi);
++
++	hac_panel_disable(&hac->base);
++}
++
++static struct mipi_dsi_driver hac_panel_driver = {
++	.driver = {
++		.name = "panel-hac-720p",
++		.of_match_table = hac_of_match,
++	},
++	.probe = hac_panel_probe,
++	.remove = hac_panel_remove,
++	.shutdown = hac_panel_shutdown,
++};
++module_mipi_dsi_driver(hac_panel_driver);
++
++MODULE_AUTHOR("Max Thomas <mtinc2@gmail.com>");
++MODULE_DESCRIPTION("720P Screen");
++MODULE_LICENSE("GPL v2");
+-- 
+2.16.3
+

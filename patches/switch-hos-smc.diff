@@ -1,0 +1,25 @@
+From 5b875261695bfbc3e3eedc5c3c628d7c125433aa Mon Sep 17 00:00:00 2001
+From: shinyquagsire23 <mtinc2@gmail.com>
+Date: Sat, 21 Apr 2018 12:23:53 -0600
+Subject: HOS SMC
+
+---
+ arch/arm64/kernel/smccc-call.S | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/arch/arm64/kernel/smccc-call.S b/arch/arm64/kernel/smccc-call.S
+index 62522342e1e4..6510c70786a8 100644
+--- a/arch/arm64/kernel/smccc-call.S
++++ b/arch/arm64/kernel/smccc-call.S
+@@ -17,7 +17,7 @@
+ 
+ 	.macro SMCCC instr
+ 	.cfi_startproc
+-	\instr	#0
++	\instr	#1
+ 	ldr	x4, [sp]
+ 	stp	x0, x1, [x4, #ARM_SMCCC_RES_X0_OFFS]
+ 	stp	x2, x3, [x4, #ARM_SMCCC_RES_X2_OFFS]
+-- 
+2.16.3
+
