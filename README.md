@@ -3,6 +3,11 @@ It's Linux for Switch.
 
 ![It's Linux for Switch](https://pbs.twimg.com/media/DbPteKUU8AAFzQY.jpg)
 
+### Should I Be Using This?
+Probably not, this repo has no hardware acceleration and I didn't anticipate fail0verflow releasing their Linux sources so soon (I thought I'd probably be developing this for at *least* another month or so). Either way, you probably want [this](https://github.com/fail0verflow/shofel2) and I don't really plan on contributing here.
+
+I'll leave the repo up though to at least showcase how far I got with ~a week of development, probably could have gotten farther with some more time, maybe this will end up being retrofitted later :)
+
 ### Requirements
 - u-boot running from either TrustZone takeover or bootrom hax. Neither is provided currently, however Switch-compatible u-boot can be found [here](https://github.com/shinyquagsire23/u-boot)
 - A properly-formatted SD card. Instructions can be found below in **Compiling, Installation and Setup**
@@ -28,7 +33,7 @@ Installation of u-boot will depend on loading methods used. However once u-boot 
     - `mkdir extra_firmware`
     - Copy `nvidia/tegra210/vic04_ucode.bin` and `nvidia/tegra210/xusb.bin` from the package to `linux-next/extra_firmware/nvidia/tegra210/vic04_ucode.bin` and `linux-next/extra_firmware/nvidia/tegra210/xusb.bin`
     - It should be noted that while this may be useful for easy debugging, generated kernel images will be dirty and not strictly GPL compliant. It is recommended that, for image-based releases, that these files be installed to the initramfs.
-    - TODO: It might be better to just not have an initramfs and have these pulled from the actual root partition, with linux-firmware installed to it.
+    - TODO: These are pulled from the actual root partition (with linux-firmware installed to it) if panels are loaded as modules.
 - Ensure that you have an AArch64 cross-compiler installed.
 - `export ARCH=arm64`
 - `export CROSS_COMPILE=aarch64-linux-gnu-`
@@ -38,8 +43,8 @@ Installation of u-boot will depend on loading methods used. However once u-boot 
 - Copy the Image file from `build/hac-001/arch/arm64/boot/Image` to the `boot/` folder on your SD card's FAT partition.
 - In this repo, `mkimage -A arm -T script -O linux -d u-boot/boot.txt u-boot/boot.scr` and copy `boot.scr` to the `boot/` directory on the FAT partition of your SD card.
 - `make O=build/hac-001/ -j4 modules`
-- `make O=build/hac-001/ modules_install INSTALL_MOD_PATH=/path/to/ALARM/rootfs/`, you may need to run as root (with environment variables set again).
-- ALARM has a default initramfs which needs to be wrapped for u-boot. `mkimage -T ramdisk -C gzip -d /path/to/initramfs-linux.img /path/to/FAT/boot/initramfs.uImage`
+- `sudo -E make O=build/hac-001/ modules_install INSTALL_MOD_PATH=/path/to/ALARM/rootfs/`
+- ALARM has a default initramfs which needs to be wrapped for u-boot. `mkimage -A arm -T ramdisk -C gzip -d /path/to/initramfs-linux.img /path/to/FAT/boot/initramfs.uImage`
 - In the repo, `cd device-tree && sh build.sh && cp tegra210-hac-001.dtb /path/to/FAT/boot/`
 - Your FAT `boot/` directory should have `Image`, `initramfs.uImage`, and `tegra210-hac-001.dtb`
 - Boot through u-boot. If an error has occurred, it will open a USB mass storage device for the SD card.
