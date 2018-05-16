@@ -1,15 +1,15 @@
-From 54edf58b6dab53f5d90ae1efec4fe182c6cb04fb Mon Sep 17 00:00:00 2001
+From 646c045d5893e61f74f60005ffa0d0f8a2e45d50 Mon Sep 17 00:00:00 2001
 From: shinyquagsire23 <mtinc2@gmail.com>
-Date: Tue, 15 May 2018 23:46:06 -0600
+Date: Wed, 16 May 2018 13:57:09 -0600
 Subject: [PATCH] input: working Joy-Con rails driver
 
 ---
  .../boot/dts/nvidia/tegra210-nintendo-switch.dts   |  48 +-
  arch/arm64/configs/nintendo-switch_defconfig       |   3 +
- drivers/input/joystick/Kconfig                     |  11 +
+ drivers/input/joystick/Kconfig                     |  12 +
  drivers/input/joystick/Makefile                    |   1 +
- drivers/input/joystick/joycon.c                    | 764 +++++++++++++++++++++
- 5 files changed, 826 insertions(+), 1 deletion(-)
+ drivers/input/joystick/joycon.c                    | 874 +++++++++++++++++++++
+ 5 files changed, 937 insertions(+), 1 deletion(-)
  create mode 100644 drivers/input/joystick/joycon.c
 
 diff --git a/arch/arm64/boot/dts/nvidia/tegra210-nintendo-switch.dts b/arch/arm64/boot/dts/nvidia/tegra210-nintendo-switch.dts
@@ -96,17 +96,18 @@ index 2d0262498c9e..653df8c5f3bd 100644
 +CONFIG_INPUT_JOYSTICK=y
 +CONFIG_JOYSTICK_JOYCON=y
 diff --git a/drivers/input/joystick/Kconfig b/drivers/input/joystick/Kconfig
-index f3c2f6ea8b44..c38964100730 100644
+index f3c2f6ea8b44..c97e4e5ce21e 100644
 --- a/drivers/input/joystick/Kconfig
 +++ b/drivers/input/joystick/Kconfig
-@@ -277,6 +277,17 @@ config JOYSTICK_JOYDUMP
+@@ -277,6 +277,18 @@ config JOYSTICK_JOYDUMP
  	  To compile this driver as a module, choose M here: the
  	  module will be called joydump.
  
 +config JOYSTICK_JOYCON
 +	tristate "Joy-Con Rails"
-+	depends on CRC8
 +	select SERIAL_DEV_BUS
++	select POWER_SUPPLY
++	select CRC8
 +	help
 +	  Say Y here if you have a one or more Joy-Con connected over UART
 +
@@ -131,10 +132,10 @@ index 67651efda2e1..f494141559ed 100644
  obj-$(CONFIG_JOYSTICK_MAPLE)		+= maplecontrol.o
 diff --git a/drivers/input/joystick/joycon.c b/drivers/input/joystick/joycon.c
 new file mode 100644
-index 000000000000..2d4b9df1fd13
+index 000000000000..cd80020f3be3
 --- /dev/null
 +++ b/drivers/input/joystick/joycon.c
-@@ -0,0 +1,764 @@
+@@ -0,0 +1,874 @@
 +/*
 + *  Copyright (c) 2018 Max Thomas
 + */
@@ -174,6 +175,7 @@ index 000000000000..2d4b9df1fd13
 +#include <linux/jiffies.h>
 +#include <linux/workqueue.h>
 +#include <linux/crc8.h>
++#include <linux/power_supply.h>
 +
 +#define DRIVER_DESC	"Nintendo Joy-Con serial gamepad driver"
 +
@@ -208,8 +210,12 @@ index 000000000000..2d4b9df1fd13
 +
 +#define JOYCON_HID_DEVICE_INFO (0x2)
 +#define JOYCON_HID_SPI_READ    (0x10)
++#define JOYCON_HID_GET_REGVOLT (0x50)
 +
 +#define JOYCON_SPI_FACTORY_CAL_2 (0x603D)
++
++#define JOYCON_BATT_MV_MIN (3300)
++#define JOYCON_BATT_MV_MAX (4200)
 +
 +#define JOYCON_BUTTONS_LEFT  (0xFFE900)
 +#define JOYCON_BUTTONS_RIGHT (0x76FF)
@@ -283,6 +289,7 @@ index 000000000000..2d4b9df1fd13
 +struct joycon {
 +	struct serdev_device *serdev;
 +	struct input_dev *input_dev;
++	struct power_supply *batt_dev;
 +	struct device *dev;
 +	
 +	bool handshaken;
@@ -300,6 +307,7 @@ index 000000000000..2d4b9df1fd13
 +	struct workqueue_struct *wq;
 +	
 +	int idx;
++	u16 regvolt;
 +	u32 buttons;
 +	u8 mac[6];
 +};
@@ -339,6 +347,61 @@ index 000000000000..2d4b9df1fd13
 +	return crc8(crc_table, data, len, JOYCON_CRC8_INIT);
 +}
 +
++/*
++ * Battery stuff
++ */
++
++static enum power_supply_property joycon_battery_props[] = {
++	POWER_SUPPLY_PROP_TECHNOLOGY,
++	POWER_SUPPLY_PROP_SCOPE,
++	POWER_SUPPLY_PROP_VOLTAGE_NOW,
++	POWER_SUPPLY_PROP_VOLTAGE_MAX_DESIGN,
++	POWER_SUPPLY_PROP_VOLTAGE_MIN_DESIGN,
++};
++
++static int joycon_battery_get_property(struct power_supply *psy,
++				       enum power_supply_property psp,
++				       union power_supply_propval *val)
++{
++	struct joycon *joycon = power_supply_get_drvdata(psy);
++
++	switch (psp)
++	{
++	case POWER_SUPPLY_PROP_TECHNOLOGY:
++		val->intval = POWER_SUPPLY_TECHNOLOGY_LION;
++		break;
++	case POWER_SUPPLY_PROP_SCOPE:
++		val->intval = POWER_SUPPLY_SCOPE_DEVICE;
++		break;
++	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
++		val->intval = joycon->regvolt * 1000;
++		break;
++	case POWER_SUPPLY_PROP_VOLTAGE_MAX_DESIGN:
++		val->intval = JOYCON_BATT_MV_MAX * 1000;
++		break;
++	case POWER_SUPPLY_PROP_VOLTAGE_MIN_DESIGN:
++		val->intval = JOYCON_BATT_MV_MIN * 1000;
++		break;
++	default:
++		return -EINVAL;
++	}
++	
++	return 0;
++}
++
++static const struct power_supply_desc joycon_battery_desc = {
++	.name			= "joycon-battery",
++	.type			= POWER_SUPPLY_TYPE_BATTERY,
++	.properties		= joycon_battery_props,
++	.num_properties		= ARRAY_SIZE(joycon_battery_props),
++	.get_property		= joycon_battery_get_property,
++};
++
++
++/*
++ * Packet crafting
++ */
++
 +u16 joycon_packet_craft(u8 *out, u8 command, u8 *data, u16 size)
 +{
 +	u16 packet_size = sizeof(joycon_uart_header);
@@ -361,6 +424,7 @@ index 000000000000..2d4b9df1fd13
 +
 +u16 joycon_extcommand_craft(u8 *out, u8 command, u8 *data, u16 size)
 +{
++	u16 packet_size;
 +	struct
 +	{
 +		u8 size[2];
@@ -370,7 +434,7 @@ index 000000000000..2d4b9df1fd13
 +
 +	subcmd_data.size[0] = (size + sizeof(u8)) >> 8;
 +	subcmd_data.size[1] = (size + sizeof(u8)) & 0xFF;
-+	u16 packet_size = joycon_packet_craft(out, 0x92, (u8*)&subcmd_data, sizeof(subcmd_data));
++	packet_size = joycon_packet_craft(out, 0x92, (u8*)&subcmd_data, sizeof(subcmd_data));
 +
 +	subcmd_packet->pre.initial.total_size += size;
 +	subcmd_packet->command = command;
@@ -426,6 +490,10 @@ index 000000000000..2d4b9df1fd13
 +	joycon_send_extcommand(serdev, 1, data_gen, 0x30);
 +	//kfree(data_gen);
 +}
++
++/*
++ * Handlers
++ */
 + 
 +static void timeout_handler(struct work_struct *work)
 +{
@@ -447,7 +515,7 @@ index 000000000000..2d4b9df1fd13
 +		joycon->initialized = false;
 +
 +		err = serdev_device_write(serdev, (u8[]){0xA1, 0xA2, 0xA3, 0xA4}, 4, msecs_to_jiffies(200));
-+		if (err) goto fail;
++		if (err) goto done;
 +
 +		joycon_send_command(serdev, JOYCON_COMMAND_HANDSHAKE, (u8[]){0x02, 0x01, 0x7E}, 3); //TODO: error passing
 +		
@@ -457,13 +525,17 @@ index 000000000000..2d4b9df1fd13
 +		printk("Sent handshake\n");
 +	}
 +	
-+	if (!joycon->button_set && joycon->initialized)
++	if (!joycon->initialized) goto done;
++	
++	joycon_send_hidcommand(serdev, JOYCON_HID_GET_REGVOLT, NULL, 0);
++	
++	if (!joycon->button_set)
 +		joycon_send_hidcommand(serdev, JOYCON_HID_DEVICE_INFO, NULL, 0);
 +
 +	if (joycon->button_set && !joycon->factory_cal_2_parsed)
 +		joycon_send_hidcommand(serdev, JOYCON_HID_SPI_READ, (u8[]){0x3D, 0x60, 0x00, 0x00, 0x1E}, 5); //TODO nicer
 +
-+fail:
++done:
 +	joycon->timeout_samples = joycon->num_samples;
 +	INIT_DELAYED_WORK(&data->work,timeout_handler);
 +	queue_delayed_work(joycon->wq, &data->work, msecs_to_jiffies(200));
@@ -506,7 +578,11 @@ index 000000000000..2d4b9df1fd13
 +	queue_delayed_work(joycon->wq, &data->work, msecs_to_jiffies(10));
 +}
 +
-+static void joycon_parse_stick_cal(struct joycon_stick_calib *calib, u8* packed)
++/*
++ * Packet parsing
++ */
++
++static void joycon_parse_stick_cal(struct joycon_stick_calib *calib, const u8* packed)
 +{
 +	//min->max cent->min max->cent
 +
@@ -518,13 +594,23 @@ index 000000000000..2d4b9df1fd13
 +	calib->y_max = (packed[8] << 4) | (packed[7] >> 4);
 +}
 +
-+static void joycon_parse_spi_read(struct serdev_device *serdev, u8* packet, u32 size)
++static void joycon_calib_absinfo(struct input_absinfo *absinfo, unsigned int ax, 
++				 unsigned int ay, struct joycon_stick_calib *calib)
++{
++	absinfo[ax].minimum = calib->x_cent - calib->x_min;
++	absinfo[ax].maximum = calib->x_cent + calib->x_max;
++	absinfo[ay].minimum = calib->y_cent - calib->y_min;
++	absinfo[ay].maximum = calib->y_cent + calib->y_max;
++}
++
++static void joycon_parse_spi_read(struct serdev_device *serdev, const u8* packet, u32 size)
 +{
 +	struct joycon *joycon = serdev_device_get_drvdata(serdev);
-+	u32 addr = (packet[4] << 24) | (packet[3] << 16) | (packet[2] << 8) | packet[1];
++	u32 addr = (packet[4] << 24) | (packet[3] << 16) | (packet[2] << 8)
++	           | packet[1];
 +	u8 bytes_read = packet[5];
 +	
-+	if (addr == JOYCON_SPI_FACTORY_CAL_2)
++	if (addr == JOYCON_SPI_FACTORY_CAL_2 && bytes_read >= 0x1E)
 +	{
 +		joycon_parse_stick_cal(&joycon->l_calib, packet + 5);
 +		joycon_parse_stick_cal(&joycon->r_calib, packet + 14);
@@ -533,19 +619,15 @@ index 000000000000..2d4b9df1fd13
 +		
 +		if (joycon->button_set & JOYCON_BUTTONSET_LEFT)
 +		{
-+			input_dev->absinfo[ABS_X].minimum = joycon->l_calib.x_cent - joycon->l_calib.x_min;
-+			input_dev->absinfo[ABS_X].maximum = joycon->l_calib.x_cent + joycon->l_calib.x_max;
-+			input_dev->absinfo[ABS_Y].minimum = joycon->l_calib.y_cent - joycon->l_calib.y_min;
-+			input_dev->absinfo[ABS_Y].maximum = joycon->l_calib.y_cent + joycon->l_calib.y_max;
++			joycon_calib_absinfo(input_dev->absinfo, ABS_X, ABS_Y, 
++					     &joycon->l_calib);
 +			printk("Parsed left joystick configs\n");
 +		}
 +		
 +		if (joycon->button_set & JOYCON_BUTTONSET_RIGHT)
 +		{
-+			input_dev->absinfo[ABS_RX].minimum = joycon->l_calib.x_cent - joycon->r_calib.x_min;
-+			input_dev->absinfo[ABS_RX].maximum = joycon->l_calib.x_cent + joycon->r_calib.x_max;
-+			input_dev->absinfo[ABS_RY].minimum = joycon->l_calib.y_cent - joycon->r_calib.y_min;
-+			input_dev->absinfo[ABS_RY].maximum = joycon->l_calib.x_cent + joycon->r_calib.y_max;
++			joycon_calib_absinfo(input_dev->absinfo, ABS_RX, ABS_RY, 
++					     &joycon->r_calib);
 +			printk("Parsed right joystick configs\n");
 +		}
 +		
@@ -553,7 +635,7 @@ index 000000000000..2d4b9df1fd13
 +	}
 +}
 +
-+static void joycon_hidret_parse(struct serdev_device *serdev, u8* packet, u32 size)
++static void joycon_hidret_parse(struct serdev_device *serdev, const u8* packet, u32 size)
 +{
 +	struct joycon *joycon = serdev_device_get_drvdata(serdev);
 +	switch (packet[0])
@@ -573,6 +655,14 @@ index 000000000000..2d4b9df1fd13
 +	case JOYCON_HID_SPI_READ:
 +		joycon_parse_spi_read(serdev, packet, size);
 +		break;
++	case JOYCON_HID_GET_REGVOLT:
++		// The actual regulated battery voltage is the raw * 2.5
++		joycon->regvolt = packet[1] | packet[2] << 8;
++		joycon->regvolt *= 5;
++		joycon->regvolt /= 2;
++
++		printk("Got regulated voltage %umV\n", joycon->regvolt); 
++		break;
 +	default:
 +		printk("Unknown hidret %x\n", packet[0]);
 +		break;
@@ -581,10 +671,9 @@ index 000000000000..2d4b9df1fd13
 +	//print_bytes(packet, size);
 +}
 +
-+static void joycon_extret_parse(struct serdev_device *serdev, u8* packet, u32 size)
++static void joycon_extret_parse(struct serdev_device *serdev, const u8* packet, u32 size)
 +{
 +	struct joycon *joycon = serdev_device_get_drvdata(serdev);
-+	struct input_dev *input_dev = joycon->input_dev;
 +
 +	switch (packet[0])
 +	{
@@ -628,7 +717,7 @@ index 000000000000..2d4b9df1fd13
 +	}
 +}
 +
-+static void joycon_initret_parse(struct serdev_device *serdev, u8* packet, u32 size)
++static void joycon_initret_parse(struct serdev_device *serdev, const u8* packet, u32 size)
 +{
 +	struct joycon *joycon = serdev_device_get_drvdata(serdev);
 +	int i, j;
@@ -636,10 +725,11 @@ index 000000000000..2d4b9df1fd13
 +	switch (packet[0])
 +	{
 +	case JOYCON_INIT_MAC:
-+
-+	for (i = 0xC; i >= 0x6; i--)
++		for (i = 0xC, j = 0; i >= 0x6; i--)
 +			joycon->mac[j++] = packet[i];
-+		printk("Joy-Con with MAC %02X::%02X::%02X::%02X::%02X::%02X\n", joycon->mac[0], joycon->mac[1], joycon->mac[2], joycon->mac[3], joycon->mac[4], joycon->mac[5]);
++		printk("Joy-Con with MAC %02X::%02X::%02X::%02X::%02X::%02X\n", 
++			joycon->mac[0], joycon->mac[1], joycon->mac[2], 
++			joycon->mac[3], joycon->mac[4], joycon->mac[5]);
 +			
 +		// Next init command
 +		//serdev_device_write(serdev, switch_baud, sizeof(switch_baud), msecs_to_jiffies(200));
@@ -667,7 +757,7 @@ index 000000000000..2d4b9df1fd13
 +	}
 +}
 +
-+static void joycon_packet_parse(struct serdev_device *serdev, u8* packet, size_t size)
++static void joycon_packet_parse(struct serdev_device *serdev, const u8* packet, size_t size)
 +{
 +	struct joycon *joycon = serdev_device_get_drvdata(serdev);
 +	joycon_uart_header* header = (joycon_uart_header*) packet;
@@ -712,6 +802,10 @@ index 000000000000..2d4b9df1fd13
 +	//printk("Wakeup\n");
 +}
 +
++/*
++ * Serdev driver
++ */
++
 +static int joycon_serdev_probe(struct serdev_device *serdev)
 +{
 +	struct joycon *joycon;
@@ -719,6 +813,7 @@ index 000000000000..2d4b9df1fd13
 +	struct work_timeout_poll *work_timeout;
 +	struct work_input_poll *work_input;
 +	struct work_sync_poll *work_sync;
++	struct power_supply_config psy_cfg = {};
 +	int i;
 +	int err = -ENOMEM;
 +
@@ -766,6 +861,18 @@ index 000000000000..2d4b9df1fd13
 +	queue_delayed_work(joycon->wq, &work_sync->work, msecs_to_jiffies(10));
 +
 +input_exists:
++
++	psy_cfg.of_node = serdev->dev.of_node;
++	psy_cfg.drv_data = joycon;
++	joycon->batt_dev = devm_power_supply_register(&serdev->dev, &joycon_battery_desc,
++					              &psy_cfg);
++
++	err = PTR_ERR_OR_ZERO(joycon->batt_dev);
++	if (err) {
++		dev_err(&serdev->dev, "failed to register power supply\n");
++		goto fail1;
++	}
++
 +	joycon->serdev = serdev;
 +	joycon->dev = &serdev->dev;
 +	joycon->input_dev = input_dev;
@@ -836,6 +943,10 @@ index 000000000000..2d4b9df1fd13
 +	.receive_buf = joycon_serdev_receive_buf,
 +	.write_wakeup = joycon_serdev_write_wakeup,
 +};
++
++/*
++ * Joy-Con base driver
++ */
 +
 +static int joycon_probe(struct platform_device *pdev)
 +{
