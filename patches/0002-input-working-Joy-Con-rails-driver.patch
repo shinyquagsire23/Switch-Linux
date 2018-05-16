@@ -1,6 +1,6 @@
-From 646c045d5893e61f74f60005ffa0d0f8a2e45d50 Mon Sep 17 00:00:00 2001
+From 1976056d5f5c7f046985b4918e53d0431e5961cb Mon Sep 17 00:00:00 2001
 From: shinyquagsire23 <mtinc2@gmail.com>
-Date: Wed, 16 May 2018 13:57:09 -0600
+Date: Wed, 16 May 2018 15:29:59 -0600
 Subject: [PATCH] input: working Joy-Con rails driver
 
 ---
@@ -8,8 +8,8 @@ Subject: [PATCH] input: working Joy-Con rails driver
  arch/arm64/configs/nintendo-switch_defconfig       |   3 +
  drivers/input/joystick/Kconfig                     |  12 +
  drivers/input/joystick/Makefile                    |   1 +
- drivers/input/joystick/joycon.c                    | 874 +++++++++++++++++++++
- 5 files changed, 937 insertions(+), 1 deletion(-)
+ drivers/input/joystick/joycon.c                    | 932 +++++++++++++++++++++
+ 5 files changed, 995 insertions(+), 1 deletion(-)
  create mode 100644 drivers/input/joystick/joycon.c
 
 diff --git a/arch/arm64/boot/dts/nvidia/tegra210-nintendo-switch.dts b/arch/arm64/boot/dts/nvidia/tegra210-nintendo-switch.dts
@@ -132,10 +132,10 @@ index 67651efda2e1..f494141559ed 100644
  obj-$(CONFIG_JOYSTICK_MAPLE)		+= maplecontrol.o
 diff --git a/drivers/input/joystick/joycon.c b/drivers/input/joystick/joycon.c
 new file mode 100644
-index 000000000000..cd80020f3be3
+index 000000000000..9a3ee322e004
 --- /dev/null
 +++ b/drivers/input/joystick/joycon.c
-@@ -0,0 +1,874 @@
+@@ -0,0 +1,932 @@
 +/*
 + *  Copyright (c) 2018 Max Thomas
 + */
@@ -213,6 +213,8 @@ index 000000000000..cd80020f3be3
 +#define JOYCON_HID_GET_REGVOLT (0x50)
 +
 +#define JOYCON_SPI_FACTORY_CAL_2 (0x603D)
++#define JOYCON_SPI_FACTORY_CAL_3 (0x6080)
++#define JOYCON_SPI_STICK_USERCAL (0x8010)
 +
 +#define JOYCON_BATT_MV_MIN (3300)
 +#define JOYCON_BATT_MV_MAX (4200)
@@ -291,10 +293,13 @@ index 000000000000..cd80020f3be3
 +	struct input_dev *input_dev;
 +	struct power_supply *batt_dev;
 +	struct device *dev;
++	struct power_supply_desc batt_desc;
 +	
 +	bool handshaken;
 +	bool initialized;
 +	bool factory_cal_2_parsed;
++	bool factory_cal_3_parsed;
++	bool usercal_parsed;
 +	
 +	int timeout_samples;
 +	int num_samples;
@@ -325,6 +330,7 @@ index 000000000000..cd80020f3be3
 +static struct input_dev *input_dev;
 +static u32 buttons;
 +static int stick_lx, stick_ly, stick_rx, stick_ry;
++static int joycon_increment;
 +
 +
 +struct work_timeout_poll {
@@ -354,6 +360,7 @@ index 000000000000..cd80020f3be3
 +static enum power_supply_property joycon_battery_props[] = {
 +	POWER_SUPPLY_PROP_TECHNOLOGY,
 +	POWER_SUPPLY_PROP_SCOPE,
++	POWER_SUPPLY_PROP_CAPACITY,
 +	POWER_SUPPLY_PROP_VOLTAGE_NOW,
 +	POWER_SUPPLY_PROP_VOLTAGE_MAX_DESIGN,
 +	POWER_SUPPLY_PROP_VOLTAGE_MIN_DESIGN,
@@ -373,6 +380,9 @@ index 000000000000..cd80020f3be3
 +	case POWER_SUPPLY_PROP_SCOPE:
 +		val->intval = POWER_SUPPLY_SCOPE_DEVICE;
 +		break;
++	case POWER_SUPPLY_PROP_CAPACITY:
++		val->intval = ((joycon->regvolt-JOYCON_BATT_MV_MIN)*100)/(JOYCON_BATT_MV_MAX-JOYCON_BATT_MV_MIN);
++		break;
 +	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
 +		val->intval = joycon->regvolt * 1000;
 +		break;
@@ -388,14 +398,6 @@ index 000000000000..cd80020f3be3
 +	
 +	return 0;
 +}
-+
-+static const struct power_supply_desc joycon_battery_desc = {
-+	.name			= "joycon-battery",
-+	.type			= POWER_SUPPLY_TYPE_BATTERY,
-+	.properties		= joycon_battery_props,
-+	.num_properties		= ARRAY_SIZE(joycon_battery_props),
-+	.get_property		= joycon_battery_get_property,
-+};
 +
 +
 +/*
@@ -528,12 +530,6 @@ index 000000000000..cd80020f3be3
 +	if (!joycon->initialized) goto done;
 +	
 +	joycon_send_hidcommand(serdev, JOYCON_HID_GET_REGVOLT, NULL, 0);
-+	
-+	if (!joycon->button_set)
-+		joycon_send_hidcommand(serdev, JOYCON_HID_DEVICE_INFO, NULL, 0);
-+
-+	if (joycon->button_set && !joycon->factory_cal_2_parsed)
-+		joycon_send_hidcommand(serdev, JOYCON_HID_SPI_READ, (u8[]){0x3D, 0x60, 0x00, 0x00, 0x1E}, 5); //TODO nicer
 +
 +done:
 +	joycon->timeout_samples = joycon->num_samples;
@@ -546,11 +542,22 @@ index 000000000000..cd80020f3be3
 +	struct work_input_poll * data = (struct work_input_poll *)work;
 +	struct joycon *joycon = data->joycon;
 +	
-+	if (joycon->initialized)
-+	{
-+		serdev_device_write(joycon->serdev, controller_status, sizeof(controller_status), msecs_to_jiffies(200));
-+	}
-+	
++	if (!joycon->initialized) goto done;
++	serdev_device_write(joycon->serdev, controller_status, sizeof(controller_status), msecs_to_jiffies(200));
++
++	if (!joycon->button_set)
++		joycon_send_hidcommand(joycon->serdev, JOYCON_HID_DEVICE_INFO, NULL, 0);
++
++	if (joycon->button_set && !joycon->factory_cal_2_parsed)
++		joycon_send_hidcommand(joycon->serdev, JOYCON_HID_SPI_READ, (u8[]){0x3D, 0x60, 0x00, 0x00, 0x1E}, 5); //TODO nicer
++
++	if (joycon->factory_cal_2_parsed && !joycon->usercal_parsed)
++		joycon_send_hidcommand(joycon->serdev, JOYCON_HID_SPI_READ, (u8[]){0x10, 0x80, 0x00, 0x00, 0x2F}, 5); //TODO nicer
++
++	if (joycon->factory_cal_2_parsed && !joycon->factory_cal_3_parsed)
++		joycon_send_hidcommand(joycon->serdev, JOYCON_HID_SPI_READ, (u8[]){0x80, 0x60, 0x00, 0x00, 0x17}, 5); //TODO nicer
++
++done:
 +	INIT_DELAYED_WORK(&data->work, input_handler);
 +	queue_delayed_work(joycon->wq, &data->work, msecs_to_jiffies(16));
 +}
@@ -633,6 +640,48 @@ index 000000000000..cd80020f3be3
 +		
 +		joycon->factory_cal_2_parsed = true;
 +	}
++	else if (addr == JOYCON_SPI_STICK_USERCAL)
++	{
++		if (packet[6] == 0xB2 && packet[7] == 0xA1 
++		    && joycon->button_set & JOYCON_BUTTONSET_LEFT)
++		{
++			joycon_parse_stick_cal(&joycon->l_calib, packet + 7);
++			joycon_calib_absinfo(input_dev->absinfo, ABS_X, ABS_Y, 
++					     &joycon->l_calib);
++			printk("Parsed left joystick user configs\n");
++		}
++			
++		if (packet[16] == 0xB2 && packet[17] == 0xA1
++		    && joycon->button_set & JOYCON_BUTTONSET_RIGHT)
++		{
++			joycon_parse_stick_cal(&joycon->r_calib, packet + 17);
++			joycon_calib_absinfo(input_dev->absinfo, ABS_RX, ABS_RY, 
++					     &joycon->r_calib);
++			printk("Parsed right joystick user configs\n");
++		}
++
++		//TODO: six-axis
++
++		joycon->usercal_parsed = true;	
++	}
++	else if (addr == JOYCON_SPI_FACTORY_CAL_3)
++	{
++		u16 dead_zone = packet[6+4] | (packet[6+5] << 8);
++		
++		/*if (joycon->button_set & JOYCON_BUTTONSET_LEFT)
++		{
++			input_dev->absinfo[ABS_X].flat = dead_zone;
++			input_dev->absinfo[ABS_Y].flat = dead_zone;
++		}
++		
++		if (joycon->button_set & JOYCON_BUTTONSET_RIGHT)
++		{
++			input_dev->absinfo[ABS_RX].flat = dead_zone;
++			input_dev->absinfo[ABS_RY].flat = dead_zone;
++		}*/
++		
++		joycon->factory_cal_3_parsed = true;
++	}
 +}
 +
 +static void joycon_hidret_parse(struct serdev_device *serdev, const u8* packet, u32 size)
@@ -660,8 +709,6 @@ index 000000000000..cd80020f3be3
 +		joycon->regvolt = packet[1] | packet[2] << 8;
 +		joycon->regvolt *= 5;
 +		joycon->regvolt /= 2;
-+
-+		printk("Got regulated voltage %umV\n", joycon->regvolt); 
 +		break;
 +	default:
 +		printk("Unknown hidret %x\n", packet[0]);
@@ -745,6 +792,8 @@ index 000000000000..cd80020f3be3
 +		joycon->button_set = 0;
 +		joycon->num_samples = 0;
 +		joycon->factory_cal_2_parsed = false;
++		joycon->factory_cal_3_parsed = false;
++		joycon->usercal_parsed = false;
 +		joycon->initialized = true;
 +		break;
 +	case JOYCON_INIT_BAUDRATE:
@@ -864,7 +913,14 @@ index 000000000000..cd80020f3be3
 +
 +	psy_cfg.of_node = serdev->dev.of_node;
 +	psy_cfg.drv_data = joycon;
-+	joycon->batt_dev = devm_power_supply_register(&serdev->dev, &joycon_battery_desc,
++	
++	joycon->batt_desc.name = kasprintf(GFP_KERNEL, "joycon_battery_%u", joycon_increment++);
++	joycon->batt_desc.type = POWER_SUPPLY_TYPE_BATTERY;
++	joycon->batt_desc.properties = joycon_battery_props;
++	joycon->batt_desc.num_properties = ARRAY_SIZE(joycon_battery_props);
++	joycon->batt_desc.get_property = joycon_battery_get_property;
++	
++	joycon->batt_dev = devm_power_supply_register(&serdev->dev, &joycon->batt_desc,
 +					              &psy_cfg);
 +
 +	err = PTR_ERR_OR_ZERO(joycon->batt_dev);
@@ -916,6 +972,7 @@ index 000000000000..cd80020f3be3
 +	flush_workqueue(joycon->wq);
 +	destroy_workqueue(joycon->wq);
 +	
++	kfree(joycon->batt_desc.name);
 +	kfree(joycon);
 +}
 +
@@ -997,6 +1054,7 @@ index 000000000000..cd80020f3be3
 +	platform_driver_register(&joycon_driver);
 +	serdev_device_driver_register(&joycon_serdev_driver);
 +	
++	joycon_increment = 0;
 +	crc8_populate_lsb(crc_table, JOYCON_CRC8_POLY);
 +
 +	return 0;
