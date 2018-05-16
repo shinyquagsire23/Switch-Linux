@@ -1,22 +1,22 @@
-From 1976056d5f5c7f046985b4918e53d0431e5961cb Mon Sep 17 00:00:00 2001
+From cd3f584e8fa3494395e78f05c3804cecf11584bd Mon Sep 17 00:00:00 2001
 From: shinyquagsire23 <mtinc2@gmail.com>
-Date: Wed, 16 May 2018 15:29:59 -0600
+Date: Wed, 16 May 2018 16:26:15 -0600
 Subject: [PATCH] input: working Joy-Con rails driver
 
 ---
- .../boot/dts/nvidia/tegra210-nintendo-switch.dts   |  48 +-
+ .../boot/dts/nvidia/tegra210-nintendo-switch.dts   |  66 +-
  arch/arm64/configs/nintendo-switch_defconfig       |   3 +
  drivers/input/joystick/Kconfig                     |  12 +
  drivers/input/joystick/Makefile                    |   1 +
- drivers/input/joystick/joycon.c                    | 932 +++++++++++++++++++++
- 5 files changed, 995 insertions(+), 1 deletion(-)
+ drivers/input/joystick/joycon.c                    | 950 +++++++++++++++++++++
+ 5 files changed, 1031 insertions(+), 1 deletion(-)
  create mode 100644 drivers/input/joystick/joycon.c
 
 diff --git a/arch/arm64/boot/dts/nvidia/tegra210-nintendo-switch.dts b/arch/arm64/boot/dts/nvidia/tegra210-nintendo-switch.dts
-index 814f414e31ed..3e69e21da180 100644
+index 814f414e31ed..44de6b5262e5 100644
 --- a/arch/arm64/boot/dts/nvidia/tegra210-nintendo-switch.dts
 +++ b/arch/arm64/boot/dts/nvidia/tegra210-nintendo-switch.dts
-@@ -183,6 +183,40 @@
+@@ -183,6 +183,56 @@
  				nvidia,enable-input = <TEGRA_PIN_ENABLE>;
  				nvidia,open-drain = <TEGRA_PIN_DISABLE>;
  			};
@@ -26,6 +26,14 @@ index 814f414e31ed..3e69e21da180 100644
 +				nvidia,pull = <TEGRA_PIN_PULL_UP>;
 +				nvidia,tristate = <TEGRA_PIN_DISABLE>;
 +				nvidia,enable-input = <TEGRA_PIN_ENABLE>;
++				nvidia,open-drain = <TEGRA_PIN_DISABLE>;
++			};
++			joycon_right_charge {
++				nvidia,pins = "pk3";
++				nvidia,function = "rsvd2";
++				nvidia,pull = <TEGRA_PIN_PULL_NONE>;
++				nvidia,tristate = <TEGRA_PIN_DISABLE>;
++				nvidia,enable-input = <TEGRA_PIN_DISABLE>;
 +				nvidia,open-drain = <TEGRA_PIN_DISABLE>;
 +			};
 +
@@ -54,10 +62,18 @@ index 814f414e31ed..3e69e21da180 100644
 +				nvidia,enable-input = <TEGRA_PIN_ENABLE>;
 +				nvidia,open-drain = <TEGRA_PIN_DISABLE>;
 +			};
++			joycon_left_charge {
++				nvidia,pins = "spdif_in_pcc3";
++				nvidia,function = "rsvd1";
++				nvidia,pull = <TEGRA_PIN_PULL_NONE>;
++				nvidia,tristate = <TEGRA_PIN_DISABLE>;
++				nvidia,enable-input = <TEGRA_PIN_DISABLE>;
++				nvidia,open-drain = <TEGRA_PIN_DISABLE>;
++			};
  
  			// SD card
  			sdmmc1_clk {
-@@ -391,13 +425,25 @@
+@@ -391,13 +441,27 @@
  	/* right joycon */
  	serial@70006040 {
  		status = "okay";
@@ -68,6 +84,7 @@ index 814f414e31ed..3e69e21da180 100644
 +
 +		joycon {
 +			compatible = "nintendo,joycon-uart";
++			charge-gpios = <&gpio TEGRA_GPIO(K, 3) GPIO_ACTIVE_HIGH>;
 +		};
  	};
  
@@ -80,6 +97,7 @@ index 814f414e31ed..3e69e21da180 100644
 +
 +		joycon {
 +			compatible = "nintendo,joycon-uart";
++			charge-gpios = <&gpio TEGRA_GPIO(CC, 3) GPIO_ACTIVE_HIGH>;
 +		};
  	};
  
@@ -132,10 +150,10 @@ index 67651efda2e1..f494141559ed 100644
  obj-$(CONFIG_JOYSTICK_MAPLE)		+= maplecontrol.o
 diff --git a/drivers/input/joystick/joycon.c b/drivers/input/joystick/joycon.c
 new file mode 100644
-index 000000000000..9a3ee322e004
+index 000000000000..3179926b19c3
 --- /dev/null
 +++ b/drivers/input/joystick/joycon.c
-@@ -0,0 +1,932 @@
+@@ -0,0 +1,950 @@
 +/*
 + *  Copyright (c) 2018 Max Thomas
 + */
@@ -176,6 +194,7 @@ index 000000000000..9a3ee322e004
 +#include <linux/workqueue.h>
 +#include <linux/crc8.h>
 +#include <linux/power_supply.h>
++#include <linux/gpio/consumer.h>
 +
 +#define DRIVER_DESC	"Nintendo Joy-Con serial gamepad driver"
 +
@@ -294,6 +313,7 @@ index 000000000000..9a3ee322e004
 +	struct power_supply *batt_dev;
 +	struct device *dev;
 +	struct power_supply_desc batt_desc;
++	struct gpio_desc *charge_gpio;
 +	
 +	bool handshaken;
 +	bool initialized;
@@ -371,6 +391,7 @@ index 000000000000..9a3ee322e004
 +				       union power_supply_propval *val)
 +{
 +	struct joycon *joycon = power_supply_get_drvdata(psy);
++	u32 regvolt_scaled, total_scaled;
 +
 +	switch (psp)
 +	{
@@ -381,7 +402,9 @@ index 000000000000..9a3ee322e004
 +		val->intval = POWER_SUPPLY_SCOPE_DEVICE;
 +		break;
 +	case POWER_SUPPLY_PROP_CAPACITY:
-+		val->intval = ((joycon->regvolt-JOYCON_BATT_MV_MIN)*100)/(JOYCON_BATT_MV_MAX-JOYCON_BATT_MV_MIN);
++		regvolt_scaled = ((joycon->regvolt - JOYCON_BATT_MV_MIN) * 100);
++		total_scaled = (JOYCON_BATT_MV_MAX - JOYCON_BATT_MV_MIN);
++		val->intval = regvolt_scaled / total_scaled;
 +		break;
 +	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
 +		val->intval = joycon->regvolt * 1000;
@@ -515,6 +538,8 @@ index 000000000000..9a3ee322e004
 +	{
 +		joycon->handshaken = false;
 +		joycon->initialized = false;
++		joycon->regvolt = 0;
++		gpiod_set_value(joycon->charge_gpio, 0);
 +
 +		err = serdev_device_write(serdev, (u8[]){0xA1, 0xA2, 0xA3, 0xA4}, 4, msecs_to_jiffies(200));
 +		if (err) goto done;
@@ -667,6 +692,7 @@ index 000000000000..9a3ee322e004
 +	else if (addr == JOYCON_SPI_FACTORY_CAL_3)
 +	{
 +		u16 dead_zone = packet[6+4] | (packet[6+5] << 8);
++		printk("Dead zone %x\n", dead_zone);
 +		
 +		/*if (joycon->button_set & JOYCON_BUTTONSET_LEFT)
 +		{
@@ -795,6 +821,8 @@ index 000000000000..9a3ee322e004
 +		joycon->factory_cal_3_parsed = false;
 +		joycon->usercal_parsed = false;
 +		joycon->initialized = true;
++		
++		gpiod_set_value(joycon->charge_gpio, 1);
 +		break;
 +	case JOYCON_INIT_BAUDRATE:
 +		serdev_device_set_baudrate(serdev, 3000000);
@@ -895,10 +923,10 @@ index 000000000000..9a3ee322e004
 +		__set_bit(joycon_common_btn[i], input_dev->keybit);
 +
 +	//TODO: dead zones
-+	input_set_abs_params(input_dev, ABS_X, 0x400, 0xC00, 0, 200);
-+	input_set_abs_params(input_dev, ABS_Y, 0x400, 0xC00, 0, 200);
-+	input_set_abs_params(input_dev, ABS_RX, 0x400, 0xC00, 0, 200);
-+	input_set_abs_params(input_dev, ABS_RY, 0x400, 0xC00, 0, 200);
++	input_set_abs_params(input_dev, ABS_X, 0x400, 0xC00, 0, 180);
++	input_set_abs_params(input_dev, ABS_Y, 0x400, 0xC00, 0, 180);
++	input_set_abs_params(input_dev, ABS_RX, 0x400, 0xC00, 0, 180);
++	input_set_abs_params(input_dev, ABS_RY, 0x400, 0xC00, 0, 180);
 +	
 +	err = input_register_device(input_dev);
 +	if (err) goto fail1;
@@ -941,6 +969,14 @@ index 000000000000..9a3ee322e004
 +	serdev_device_set_baudrate(serdev, 1000000);
 +	
 +	serdev_device_set_client_ops(serdev, &joycon_ops);
++	
++	// Get charging GPIO
++	joycon->charge_gpio = devm_gpiod_get(&serdev->dev, "charge", GPIOD_OUT_LOW);
++	if (IS_ERR(joycon->charge_gpio)) {
++		err = PTR_ERR(joycon->charge_gpio);
++		dev_err(&serdev->dev, "cannot get charge-gpio %d\n", err);
++		goto fail3;
++	}
 +	
 +	// Set up work polling
 +	work_timeout = kmalloc(sizeof(struct work_timeout_poll), GFP_KERNEL);
